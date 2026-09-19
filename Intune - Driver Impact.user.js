@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Intune - Driver Impact
 // @namespace    xento.betterintuneui
-// @version      0.6.0
+// @version      0.8.0
 // @description  Shows devices affected by Windows Autopatch / Intune driver updates, including model distribution and device details.
 // @author       Xento
 // @match        https://intune.microsoft.com/*
@@ -17,11 +17,14 @@
 
     const SCRIPT = {
         id: 'tm-intune-driver-impact-v1',
-        version: '0.6.0',
+        version: '0.8.0',
         debug: true,
         graph: 'https://graph.microsoft.com',
         maxBatch: 20,
         deviceBatchConcurrency: 2,
+        driverReportPageSize: 250,
+        driverReportInterPageDelayMs: 750,
+        driverReportCacheTtlMs: 5 * 60 * 1000,
     };
 
     const state = {
@@ -31,6 +34,7 @@
         originalFetch: window.fetch ? window.fetch.bind(window) : null,
         uiObserver: null,
         currentLoadAbort: null,
+        reportCache: new Map(),
     };
 
     const log = (...args) => SCRIPT.debug && console.debug('[TM Driver Impact]', ...args);
@@ -691,6 +695,26 @@
         }
     }
 
+    function getRetryAfterMs(headers) {
+        if (!headers?.get) return 0;
+
+        // Some Microsoft services expose an explicit millisecond hint.
+        const msHint = Number(headers.get('x-ms-retry-after-ms') || 0);
+        if (Number.isFinite(msHint) && msHint > 0) return msHint;
+
+        const raw = normalizeText(headers.get('Retry-After') || headers.get('retry-after') || '');
+        if (!raw) return 0;
+
+        // Standard Graph responses normally return seconds, but HTTP-date is
+        // valid as well. Support both so we never hammer a throttled endpoint.
+        const seconds = Number(raw);
+        if (Number.isFinite(seconds) && seconds > 0) return seconds * 1000;
+
+        const retryDate = Date.parse(raw);
+        if (Number.isFinite(retryDate)) return Math.max(0, retryDate - Date.now());
+        return 0;
+    }
+
     async function graphRequest(url, {
         method = 'GET',
         body = undefined,
@@ -727,22 +751,24 @@
                 path = `${u.pathname}${u.search || ''}`;
             } catch { /* keep absolute URL */ }
             const statusText = `${response.status}${code ? ` / ${code}` : ''}`;
-            const error = new Error(`Graph ${method} ${path} failed (${statusText}): ${detail}`);
+            const requestId = response.headers?.get?.('request-id') || response.headers?.get?.('x-ms-request-id') || '';
+            const error = new Error(`Graph ${method} ${path} failed (${statusText}): ${detail}${requestId ? ` [request-id ${requestId}]` : ''}`);
             error.status = response.status;
             error.code = code;
             error.data = data;
             error.url = absoluteUrl;
-            const retryAfter = Number(response.headers?.get?.('Retry-After') || 0);
-            error.retryAfterMs = Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter * 1000 : 0;
+            error.requestId = requestId;
+            error.retryAfterMs = getRetryAfterMs(response.headers);
             throw error;
         }
         return data;
     }
 
     async function graphRequestRetry(url, options = {}, {
-        attempts = 5,
+        attempts = 8,
         retryStatuses = [429, 500, 502, 503, 504],
-        baseDelayMs = 500,
+        baseDelayMs = 1500,
+        maxDelayMs = 60000,
         onRetry = null,
     } = {}) {
         let lastError = null;
@@ -752,8 +778,15 @@
             } catch (e) {
                 lastError = e;
                 if (attempt >= attempts || !retryStatuses.includes(Number(e?.status))) throw e;
-                const delay = Math.max(Number(e?.retryAfterMs || 0), baseDelayMs * attempt);
-                onRetry?.(e, attempt, delay);
+
+                const status = Number(e?.status || 0);
+                const hinted = Number(e?.retryAfterMs || 0);
+                const fallbackBase = status === 429 ? Math.max(baseDelayMs, 5000) : baseDelayMs;
+                const exponential = Math.min(maxDelayMs, fallbackBase * (2 ** (attempt - 1)));
+                // Retry-After is authoritative. Add a small positive jitter so
+                // multiple portal requests do not all resume on the same tick.
+                const delay = Math.max(hinted, exponential) + Math.floor(250 + Math.random() * 750);
+                onRetry?.(e, attempt, delay, attempts);
                 await sleep(delay);
             }
         }
@@ -1301,14 +1334,60 @@
         throw new Error('Timed out while waiting for the Intune Driver Update report cache.');
     }
 
+    const DRIVER_STATE_INFO = Object.freeze({
+        installed:  { label: 'Installed',        order: 10 },
+        offering:   { label: 'Offering',         order: 20 },
+        pending:    { label: 'Pending',          order: 30 },
+        installing: { label: 'Installing',       order: 40 },
+        cancelled:  { label: 'Cancelled',        order: 50 },
+        attention:  { label: 'Needs attention',  order: 60 },
+        unknown:    { label: 'Unknown',          order: 70 },
+    });
+
+    function canonicalDriverState(row) {
+        // Prefer non-localized/raw fields whenever possible. The Driver Update
+        // report currently exposes numeric CurrentDeviceUpdateState values and
+        // a stable AggregateState string. *_loc is display text and changes with
+        // the portal/report locale, so it must never drive summary logic alone.
+        const aggregateRaw = normalizeText(row?.aggregateStateRaw || row?.aggregateState).toLowerCase();
+        const stateRaw = normalizeText(row?.updateStateRaw);
+        const stateNumber = /^\d+$/.test(stateRaw) ? Number(stateRaw) : NaN;
+
+        if (aggregateRaw === 'error') return 'attention';
+        if (stateNumber === 8) return 'installed';
+        if (stateNumber === 6) return 'installing';
+        if (stateNumber === 2) return 'offering';
+        if (stateNumber === 1) return 'pending';
+
+        const text = normalizeText([
+            row?.updateState, row?.updateSubstate, row?.aggregateState,
+            row?.alertSubType, row?.updateStateRaw, row?.aggregateStateRaw
+        ].filter(Boolean).join(' ')).toLowerCase();
+
+        if (/(needs attention|eingreifen erforderlich|attention|error|failed|failure|fehler|fehlgeschlagen)/i.test(text)) return 'attention';
+        if (/(cancelled|canceled|cancel|abgebrochen|storniert)/i.test(text)) return 'cancelled';
+        if (/(installing|wird installiert|installation läuft|installiert wird)/i.test(text)) return 'installing';
+        if (/(offering|wird angeboten|angeboten|offer ready)/i.test(text)) return 'offering';
+        if (/(pending|ausstehend|scheduled|geplant)/i.test(text)) return 'pending';
+        if (/(installed|installiert|success|successful|erfolgreich|update installed)/i.test(text)) return 'installed';
+        return 'unknown';
+    }
+
+    function canonicalStateLabel(key) {
+        return DRIVER_STATE_INFO[key]?.label || DRIVER_STATE_INFO.unknown.label;
+    }
+
     function reportStatePriority(row) {
-        const text = `${row.aggregateState || ''} ${row.updateState || ''}`.toLowerCase();
-        if (text.includes('needs attention') || text.includes('error') || text.includes('failed')) return 50;
-        if (text.includes('cancel')) return 40;
-        if (text.includes('installing') || text.includes('in progress')) return 30;
-        if (text.includes('offering') || text.includes('pending') || text.includes('scheduled')) return 20;
-        if (text.includes('installed') || text.includes('success')) return 10;
-        return 0;
+        const key = row?.canonicalState || canonicalDriverState(row);
+        switch (key) {
+            case 'attention': return 60;
+            case 'cancelled': return 50;
+            case 'installing': return 40;
+            case 'pending': return 30;
+            case 'offering': return 20;
+            case 'installed': return 10;
+            default: return 0;
+        }
     }
 
     function normalizeDriverReportRows(rawRows) {
@@ -1320,13 +1399,18 @@
                 intuneDeviceId: x.DeviceId || '',
                 entraDeviceId: x.AadDeviceId || '',
                 updateState: x.CurrentDeviceUpdateState_loc || String(x.CurrentDeviceUpdateState ?? ''),
+                updateStateRaw: String(x.CurrentDeviceUpdateState ?? ''),
                 updateSubstate: x.CurrentDeviceUpdateSubstate_loc || String(x.CurrentDeviceUpdateSubstate ?? ''),
+                updateSubstateRaw: String(x.CurrentDeviceUpdateSubstate ?? ''),
                 updateSubstateTime: x.CurrentDeviceUpdateSubstateTime || '',
                 aggregateState: x.AggregateState_loc || x.AggregateState || '',
+                aggregateStateRaw: String(x.AggregateState ?? ''),
                 alertSubType: x.HighestPriorityAlertSubType_loc || String(x.HighestPriorityAlertSubType ?? ''),
+                alertSubTypeRaw: String(x.HighestPriorityAlertSubType ?? ''),
                 lastScanTime: x.LastWUScanTime || '',
                 policyName: x.PolicyName || '',
             };
+            row.canonicalState = canonicalDriverState(row);
             const key = normalizeText(row.entraDeviceId || row.intuneDeviceId || row.deviceName).toLowerCase();
             if (!key) continue;
             const previous = byDevice.get(key);
@@ -1356,17 +1440,32 @@
         }));
     }
 
-    async function loadDriverReportRows(driver, signal, progress) {
+    async function loadDriverReportRows(driver, signal, progress, { forceRefresh = false } = {}) {
+        const cacheKey = normalizeText(driver.driverId).toLowerCase();
+        const cached = state.reportCache.get(cacheKey);
+        const cacheAge = cached ? Date.now() - cached.timestamp : Infinity;
+        if (!forceRefresh && cached && cacheAge < SCRIPT.driverReportCacheTtlMs) {
+            progress?.(`Using cached Driver Update report (${cached.rows.length} devices, ${Math.round(cacheAge / 1000)}s old)...`);
+            return cached.rows.map(row => ({ ...row }));
+        }
+
         await ensureDriverReportConfig(driver, signal, progress);
         const filter = driverReportFilter(driver.driverId);
         const metadata = driverReportMetadata(driver);
-        // Match the native Intune portal. Its Driver Update report requests use top=50.
-        const pageSize = 50;
+
+        // The portal itself uses 50 rows, but loading the complete report that
+        // way can require dozens of immediate POSTs. This script deliberately
+        // requests 250 rows per page (already proven to work with this report)
+        // to reduce request count and therefore Intune reporting throttling.
+        const pageSize = SCRIPT.driverReportPageSize;
         let skip = 0;
         let total = Infinity;
         const all = [];
+        let page = 0;
 
         while (skip < total) {
+            if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+            const currentSkip = skip;
             const payload = await graphRequestRetry('/beta/deviceManagement/reports/getCachedReport', {
                 method: 'POST',
                 permissions: ['DeviceManagementManagedDevices.Read.All'],
@@ -1374,7 +1473,7 @@
                 body: {
                     id: DRIVER_REPORT_ID,
                     top: pageSize,
-                    skip,
+                    skip: currentSkip,
                     search: '',
                     orderBy: [],
                     filter,
@@ -1382,19 +1481,34 @@
                     metadata,
                 },
             }, {
-                attempts: 5,
-                onRetry: (e, attempt, delay) => progress?.(
-                    `Driver report page at row ${skip} returned ${e.status || 'an error'}; retry ${attempt}/4 in ${Math.round(delay / 100) / 10}s...`
-                ),
+                attempts: 8,
+                baseDelayMs: 2000,
+                onRetry: (e, attempt, delay, attempts) => {
+                    const seconds = Math.max(1, Math.ceil(delay / 1000));
+                    const reason = Number(e?.status) === 429 ? 'Intune is throttling report requests' : `Graph returned ${e?.status || 'an error'}`;
+                    progress?.(`${reason} at row ${currentSkip}. Waiting ${seconds}s before retry ${attempt + 1}/${attempts}...`);
+                },
             });
+
             total = Number(payload?.TotalRowCount ?? 0);
             const rows = reportValuesToObjects(payload);
             all.push(...rows);
             skip += rows.length;
-            progress?.(`Loading Driver Update report... ${Math.min(skip, total)}/${total} rows`);
+            page++;
+            progress?.(`Loading Driver Update report... ${Math.min(skip, total)}/${total} rows (${page} page${page === 1 ? '' : 's'})`);
             if (!rows.length) break;
+
+            // Do not burst consecutive report requests. A small delay is much
+            // cheaper than entering a tenant/user throttle window and waiting
+            // tens of seconds afterwards.
+            if (skip < total && SCRIPT.driverReportInterPageDelayMs > 0) {
+                await sleep(SCRIPT.driverReportInterPageDelayMs);
+            }
         }
-        return normalizeDriverReportRows(all);
+
+        const normalized = normalizeDriverReportRows(all);
+        state.reportCache.set(cacheKey, { timestamp: Date.now(), rows: normalized.map(row => ({ ...row })) });
+        return normalized;
     }
 
     async function resolveInstallationStates(driver, signal, progress) {
@@ -1431,10 +1545,15 @@
                 entraDeviceId: report.entraDeviceId || '',
                 intuneDeviceId: report.intuneDeviceId || md?.id || '',
                 updateState: report.updateState || '',
+                updateStateRaw: report.updateStateRaw || '',
                 updateSubstate: report.updateSubstate || '',
+                updateSubstateRaw: report.updateSubstateRaw || '',
                 updateSubstateTime: report.updateSubstateTime || '',
                 aggregateState: report.aggregateState || '',
+                aggregateStateRaw: report.aggregateStateRaw || '',
                 alertSubType: report.alertSubType || '',
+                alertSubTypeRaw: report.alertSubTypeRaw || '',
+                canonicalState: report.canonicalState || canonicalDriverState(report),
                 lastScanTime: report.lastScanTime || '',
                 policyName: report.policyName || '',
                 policyCount: report.policyCount || 0,
@@ -1451,20 +1570,29 @@
             const key = `${manufacturer.toLowerCase()}|${model.toLowerCase()}`;
             let x = map.get(key);
             if (!x) {
-                x = { manufacturer, model, count: 0, installed: 0, inProgress: 0, problems: 0, cancelled: 0 };
+                x = {
+                    manufacturer, model, count: 0,
+                    installed: 0, offering: 0, installing: 0, pending: 0,
+                    cancelled: 0, problems: 0, unknown: 0,
+                };
                 map.set(key, x);
             }
             x.count++;
-            const stateText = `${row.aggregateState || ''} ${row.updateState || ''}`.toLowerCase();
-            if (stateText.includes('needs attention') || stateText.includes('error') || stateText.includes('failed')) x.problems++;
-            else if (stateText.includes('cancel')) x.cancelled++;
-            else if (stateText.includes('installed') || stateText.includes('success')) x.installed++;
-            else x.inProgress++;
+            const canonical = row.canonicalState || canonicalDriverState(row);
+            if (canonical === 'installed') x.installed++;
+            else if (canonical === 'offering') x.offering++;
+            else if (canonical === 'installing') x.installing++;
+            else if (canonical === 'pending') x.pending++;
+            else if (canonical === 'cancelled') x.cancelled++;
+            else if (canonical === 'attention') x.problems++;
+            else x.unknown++;
         }
         const total = rows.length || 1;
-        return [...map.values()]
-            .map(x => ({ ...x, percentage: x.count / total * 100 }))
-            .sort((a, b) => b.count - a.count || a.manufacturer.localeCompare(b.manufacturer) || a.model.localeCompare(b.model));
+        return [...map.values()].map(x => ({
+            ...x,
+            inProgress: x.offering + x.installing + x.pending,
+            percentage: x.count / total * 100,
+        }));
     }
 
     // ---------------------------------------------------------------------
@@ -1590,15 +1718,21 @@
             .tm-di-progress { height:3px; flex:0 0 3px; background:var(--colorContainerBackgroundSecondary,#f3f2f1); overflow:hidden; }
             .tm-di-progress > div { height:100%; width:0; background:var(--colorControlBackgroundBrand,#0078d4); transition:width .2s ease; }
             .tm-di-status { min-height:26px; padding:6px 18px; box-sizing:border-box; color:var(--colorTextSecondary,#605e5c); font-size:12px; border-bottom:1px solid var(--colorContainerBorderPrimary,#edebe9); }
-            .tm-di-summary { display:grid; grid-template-columns:repeat(6,minmax(110px,1fr)); gap:10px; padding:12px 18px; border-bottom:1px solid var(--colorContainerBorderPrimary,#edebe9); }
+            .tm-di-summary { display:grid; grid-template-columns:repeat(4,minmax(110px,1fr)); gap:10px; padding:12px 18px 8px; }
+            .tm-di-state-summary { display:grid; grid-template-columns:repeat(7,minmax(90px,1fr)); gap:8px; padding:0 18px 12px; border-bottom:1px solid var(--colorContainerBorderPrimary,#edebe9); }
             .tm-di-card { min-width:0; padding:10px 12px; background:var(--colorContainerBackgroundSecondary,#f3f2f1); border:1px solid var(--colorContainerBorderPrimary,#edebe9); }
+            .tm-di-state-card { cursor:pointer; user-select:none; }
+            .tm-di-state-card:hover { border-color:var(--colorControlBorderFocus,#0078d4); }
+            .tm-di-state-card.is-active { border-color:var(--colorControlBorderFocus,#0078d4); box-shadow:inset 0 0 0 1px var(--colorControlBorderFocus,#0078d4); background:var(--colorControlBackgroundSelected,rgba(0,120,212,.12)); }
             .tm-di-card-value { font-size:23px; line-height:28px; font-weight:600; }
             .tm-di-card-label { margin-top:2px; color:var(--colorTextSecondary,#605e5c); font-size:11px; }
             .tm-di-main { display:grid; grid-template-columns:minmax(300px,380px) minmax(0,1fr); flex:1; min-height:0; overflow:hidden; }
             .tm-di-modelpane { min-width:0; min-height:0; overflow:auto; border-right:1px solid var(--colorContainerBorderPrimary,#edebe9); }
             .tm-di-section-title { position:sticky; top:0; z-index:2; margin:0; padding:12px 14px 8px; background:var(--colorContainerBackgroundPrimary,#fff); font-size:14px; font-weight:600; }
             .tm-di-model-table, .tm-di-device-table { width:100%; border-collapse:collapse; font-size:12px; }
-            .tm-di-model-table th, .tm-di-device-table th { position:sticky; top:0; z-index:2; text-align:left; background:var(--colorContainerBackgroundPrimary,#fff); color:var(--colorTextSecondary,#605e5c); border-bottom:1px solid var(--colorContainerBorderSecondary,#d2d0ce); padding:8px 9px; font-weight:600; white-space:nowrap; cursor:pointer; }
+            .tm-di-model-table th, .tm-di-device-table th { position:sticky; top:0; z-index:2; text-align:left; background:var(--colorContainerBackgroundPrimary,#fff); color:var(--colorTextSecondary,#605e5c); border-bottom:1px solid var(--colorContainerBorderSecondary,#d2d0ce); padding:8px 9px; font-weight:600; white-space:nowrap; cursor:pointer; user-select:none; }
+            .tm-di-sort-indicator { display:inline-block; min-width:14px; margin-left:4px; opacity:.45; font-size:10px; }
+            th.tm-di-sort-active .tm-di-sort-indicator { opacity:1; color:var(--colorTextBrand,#0078d4); }
             .tm-di-model-table td, .tm-di-device-table td { border-bottom:1px solid var(--colorContainerBorderPrimary,#edebe9); padding:7px 9px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
             .tm-di-model-table tbody tr { cursor:pointer; }
             .tm-di-model-table tbody tr:hover, .tm-di-device-table tbody tr:hover { background:var(--todoFocusRowHover,var(--colorControlBackgroundHover,#f3f2f1)); }
@@ -1621,7 +1755,8 @@
                 #${SCRIPT.id}-dialog { width:calc(100vw - 16px); height:calc(100vh - 16px); }
                 .tm-di-main { grid-template-columns:1fr; grid-template-rows:240px minmax(0,1fr); }
                 .tm-di-modelpane { border-right:0; border-bottom:1px solid var(--colorContainerBorderPrimary,#edebe9); }
-                .tm-di-summary { grid-template-columns:repeat(3,1fr); }
+                .tm-di-summary { grid-template-columns:repeat(2,1fr); }
+                .tm-di-state-summary { grid-template-columns:repeat(4,1fr); }
             }
         `;
         (document.head || document.documentElement).appendChild(style);
@@ -1674,10 +1809,17 @@
                 <div class="tm-di-summary">
                     <div class="tm-di-card"><div class="tm-di-card-value" data-summary="portal">${escapeHtml(driver.applicableDeviceCount ?? '–')}</div><div class="tm-di-card-label">Portal applicable count</div></div>
                     <div class="tm-di-card"><div class="tm-di-card-value" data-summary="reported">–</div><div class="tm-di-card-label">Reported devices</div></div>
-                    <div class="tm-di-card"><div class="tm-di-card-value" data-summary="installed">–</div><div class="tm-di-card-label">Installed</div></div>
-                    <div class="tm-di-card"><div class="tm-di-card-value" data-summary="inprogress">–</div><div class="tm-di-card-label">Open / in progress</div></div>
-                    <div class="tm-di-card"><div class="tm-di-card-value" data-summary="attention">–</div><div class="tm-di-card-label">Needs attention</div></div>
+                    <div class="tm-di-card"><div class="tm-di-card-value" data-summary="visible">–</div><div class="tm-di-card-label">Visible after filters</div></div>
                     <div class="tm-di-card"><div class="tm-di-card-value" data-summary="models">–</div><div class="tm-di-card-label">Models</div></div>
+                </div>
+                <div class="tm-di-state-summary">
+                    <div class="tm-di-card tm-di-state-card" data-status-filter="installed"><div class="tm-di-card-value" data-summary-state="installed">–</div><div class="tm-di-card-label">Installed</div></div>
+                    <div class="tm-di-card tm-di-state-card" data-status-filter="offering"><div class="tm-di-card-value" data-summary-state="offering">–</div><div class="tm-di-card-label">Offering</div></div>
+                    <div class="tm-di-card tm-di-state-card" data-status-filter="installing"><div class="tm-di-card-value" data-summary-state="installing">–</div><div class="tm-di-card-label">Installing</div></div>
+                    <div class="tm-di-card tm-di-state-card" data-status-filter="pending"><div class="tm-di-card-value" data-summary-state="pending">–</div><div class="tm-di-card-label">Pending</div></div>
+                    <div class="tm-di-card tm-di-state-card" data-status-filter="cancelled"><div class="tm-di-card-value" data-summary-state="cancelled">–</div><div class="tm-di-card-label">Cancelled</div></div>
+                    <div class="tm-di-card tm-di-state-card" data-status-filter="attention"><div class="tm-di-card-value" data-summary-state="attention">–</div><div class="tm-di-card-label">Needs attention</div></div>
+                    <div class="tm-di-card tm-di-state-card" data-status-filter="unknown"><div class="tm-di-card-value" data-summary-state="unknown">–</div><div class="tm-di-card-label">Unknown</div></div>
                 </div>
                 <div class="tm-di-note" data-note>
                     Device status comes from the Intune Windows Driver Update report. The portal's “Applicable devices” count is current applicability; report rows include deployment status and retained history, so the counts can legitimately differ.
@@ -1686,8 +1828,17 @@
                     <div class="tm-di-modelpane">
                         <h3 class="tm-di-section-title">Model distribution</h3>
                         <table class="tm-di-model-table">
-                            <thead><tr><th>Manufacturer</th><th>Model</th><th>Devices</th><th>Installed</th><th>In progress</th><th>Problems</th><th>%</th></tr></thead>
-                            <tbody data-model-body><tr><td colspan="7">Loading...</td></tr></tbody>
+                            <thead><tr>
+                                <th data-model-sort="manufacturer">Manufacturer <span class="tm-di-sort-indicator">?</span></th>
+                                <th data-model-sort="model">Model <span class="tm-di-sort-indicator">?</span></th>
+                                <th data-model-sort="count">Devices <span class="tm-di-sort-indicator">?</span></th>
+                                <th data-model-sort="installed">Installed <span class="tm-di-sort-indicator">?</span></th>
+                                <th data-model-sort="inProgress">In progress <span class="tm-di-sort-indicator">?</span></th>
+                                <th data-model-sort="cancelled">Cancelled <span class="tm-di-sort-indicator">?</span></th>
+                                <th data-model-sort="problems">Problems <span class="tm-di-sort-indicator">?</span></th>
+                                <th data-model-sort="percentage">% <span class="tm-di-sort-indicator">?</span></th>
+                            </tr></thead>
+                            <tbody data-model-body><tr><td colspan="8">Loading...</td></tr></tbody>
                         </table>
                     </div>
                     <div class="tm-di-right">
@@ -1696,6 +1847,8 @@
                             <select class="tm-di-select" data-filter="manufacturer"><option value="">All manufacturers</option></select>
                             <select class="tm-di-select" data-filter="model"><option value="">All models</option></select>
                             <select class="tm-di-select" data-filter="state"><option value="">All states</option></select>
+                            <select class="tm-di-select" data-filter="policy"><option value="">All policies</option></select>
+                            <select class="tm-di-select" data-filter="os"><option value="">All OS versions</option></select>
                             <button class="tm-di-button" data-action="copy">Copy device names</button>
                             <button class="tm-di-button" data-action="csv">Export CSV</button>
                             <button class="tm-di-button" data-action="reset">Reset filters</button>
@@ -1703,16 +1856,16 @@
                         <div class="tm-di-tablewrap">
                             <table class="tm-di-device-table">
                                 <thead><tr>
-                                    <th class="tm-di-col-device" data-sort="deviceName">Device</th>
-                                    <th class="tm-di-col-manufacturer" data-sort="manufacturer">Manufacturer</th>
-                                    <th class="tm-di-col-model" data-sort="model">Model</th>
-                                    <th class="tm-di-col-serial" data-sort="serialNumber">Serial</th>
-                                    <th class="tm-di-col-os" data-sort="osVersion">OS</th>
-                                    <th class="tm-di-col-user" data-sort="userPrincipalName">User</th>
-                                    <th class="tm-di-col-state" data-sort="updateState">State</th>
-                                    <th class="tm-di-col-policy" data-sort="policyName">Policy</th>
-                                    <th class="tm-di-col-sync" data-sort="lastScanTime">Last WU scan</th>
-                                    <th class="tm-di-col-id" data-sort="entraDeviceId">Entra device ID</th>
+                                    <th class="tm-di-col-device" data-sort="deviceName">Device <span class="tm-di-sort-indicator">?</span></th>
+                                    <th class="tm-di-col-manufacturer" data-sort="manufacturer">Manufacturer <span class="tm-di-sort-indicator">?</span></th>
+                                    <th class="tm-di-col-model" data-sort="model">Model <span class="tm-di-sort-indicator">?</span></th>
+                                    <th class="tm-di-col-serial" data-sort="serialNumber">Serial <span class="tm-di-sort-indicator">?</span></th>
+                                    <th class="tm-di-col-os" data-sort="osVersion">OS <span class="tm-di-sort-indicator">?</span></th>
+                                    <th class="tm-di-col-user" data-sort="userPrincipalName">User <span class="tm-di-sort-indicator">?</span></th>
+                                    <th class="tm-di-col-state" data-sort="canonicalState">State <span class="tm-di-sort-indicator">?</span></th>
+                                    <th class="tm-di-col-policy" data-sort="policyName">Policy <span class="tm-di-sort-indicator">?</span></th>
+                                    <th class="tm-di-col-sync" data-sort="lastScanTime">Last WU scan <span class="tm-di-sort-indicator">?</span></th>
+                                    <th class="tm-di-col-id" data-sort="entraDeviceId">Entra device ID <span class="tm-di-sort-indicator">?</span></th>
                                 </tr></thead>
                                 <tbody data-device-body><tr><td colspan="10">Loading...</td></tr></tbody>
                             </table>
@@ -1741,6 +1894,8 @@
             manufacturer: overlay.querySelector('[data-filter="manufacturer"]'),
             model: overlay.querySelector('[data-filter="model"]'),
             state: overlay.querySelector('[data-filter="state"]'),
+            policy: overlay.querySelector('[data-filter="policy"]'),
+            os: overlay.querySelector('[data-filter="os"]'),
             search: overlay.querySelector('[data-filter="search"]'),
         };
 
@@ -1748,8 +1903,10 @@
             allRows: [],
             filteredRows: [],
             models: [],
-            sortKey: 'manufacturer',
+            sortKey: 'deviceName',
             sortDesc: false,
+            modelSortKey: 'count',
+            modelSortDesc: true,
         };
 
         const setProgress = (text, percent = null, error = false) => {
@@ -1761,20 +1918,37 @@
         function updateFilterOptions() {
             const manufacturers = [...new Set(vm.allRows.map(x => x.manufacturer).filter(Boolean))].sort((a,b)=>a.localeCompare(b));
             const selectedManufacturer = refs.manufacturer.value;
-            refs.manufacturer.innerHTML = '<option value="">All manufacturers</option>' + manufacturers.map(x => `<option>${escapeHtml(x)}</option>`).join('');
+            refs.manufacturer.innerHTML = '<option value="">All manufacturers</option>' + manufacturers.map(x => `<option value="${escapeHtml(x)}">${escapeHtml(x)}</option>`).join('');
             refs.manufacturer.value = manufacturers.includes(selectedManufacturer) ? selectedManufacturer : '';
 
             const models = [...new Set(vm.allRows
                 .filter(x => !refs.manufacturer.value || x.manufacturer === refs.manufacturer.value)
                 .map(x => x.model).filter(Boolean))].sort((a,b)=>a.localeCompare(b));
             const selectedModel = refs.model.value;
-            refs.model.innerHTML = '<option value="">All models</option>' + models.map(x => `<option>${escapeHtml(x)}</option>`).join('');
+            refs.model.innerHTML = '<option value="">All models</option>' + models.map(x => `<option value="${escapeHtml(x)}">${escapeHtml(x)}</option>`).join('');
             refs.model.value = models.includes(selectedModel) ? selectedModel : '';
 
-            const states = [...new Set(vm.allRows.map(x => x.updateState).filter(Boolean))].sort((a,b)=>a.localeCompare(b));
             const selectedState = refs.state.value;
-            refs.state.innerHTML = '<option value="">All states</option>' + states.map(x => `<option>${escapeHtml(x)}</option>`).join('');
-            refs.state.value = states.includes(selectedState) ? selectedState : '';
+            refs.state.innerHTML = '<option value="">All states</option>' + Object.entries(DRIVER_STATE_INFO)
+                .map(([key, info]) => `<option value="${key}">${escapeHtml(info.label)}</option>`).join('');
+            refs.state.value = DRIVER_STATE_INFO[selectedState] ? selectedState : '';
+
+            const policies = [...new Set(vm.allRows.flatMap(x => String(x.policyName || '').split(' | ')).map(normalizeText).filter(Boolean))]
+                .sort((a,b)=>a.localeCompare(b, undefined, {numeric:true, sensitivity:'base'}));
+            const selectedPolicy = refs.policy.value;
+            refs.policy.innerHTML = '<option value="">All policies</option>' + policies.map(x => `<option value="${escapeHtml(x)}">${escapeHtml(x)}</option>`).join('');
+            refs.policy.value = policies.includes(selectedPolicy) ? selectedPolicy : '';
+
+            const osVersions = [...new Set(vm.allRows.map(x => normalizeText([x.operatingSystem, x.osVersion].filter(Boolean).join(' '))).filter(Boolean))]
+                .sort((a,b)=>a.localeCompare(b, undefined, {numeric:true, sensitivity:'base'}));
+            const selectedOs = refs.os.value;
+            refs.os.innerHTML = '<option value="">All OS versions</option>' + osVersions.map(x => `<option value="${escapeHtml(x)}">${escapeHtml(x)}</option>`).join('');
+            refs.os.value = osVersions.includes(selectedOs) ? selectedOs : '';
+        }
+
+        function rowMatchesPolicy(row, policy) {
+            if (!policy) return true;
+            return String(row.policyName || '').split(' | ').map(normalizeText).includes(policy);
         }
 
         function applyFilters() {
@@ -1782,39 +1956,92 @@
             const manufacturer = refs.manufacturer.value;
             const model = refs.model.value;
             const stateFilter = refs.state.value;
+            const policy = refs.policy.value;
+            const os = refs.os.value;
 
             vm.filteredRows = vm.allRows.filter(row => {
                 if (manufacturer && row.manufacturer !== manufacturer) return false;
                 if (model && row.model !== model) return false;
-                if (stateFilter && row.updateState !== stateFilter) return false;
+                if (stateFilter && row.canonicalState !== stateFilter) return false;
+                if (!rowMatchesPolicy(row, policy)) return false;
+                if (os && normalizeText([row.operatingSystem, row.osVersion].filter(Boolean).join(' ')) !== os) return false;
                 if (q) {
-                    const hay = [row.deviceName,row.manufacturer,row.model,row.serialNumber,row.operatingSystem,row.osVersion,row.userPrincipalName,row.updateState,row.entraDeviceId,row.intuneDeviceId]
-                        .join('\n').toLowerCase();
+                    const hay = [
+                        row.deviceName,row.manufacturer,row.model,row.serialNumber,row.operatingSystem,row.osVersion,
+                        row.userPrincipalName,row.updateState,row.updateSubstate,row.aggregateState,row.alertSubType,
+                        canonicalStateLabel(row.canonicalState),row.policyName,row.entraDeviceId,row.intuneDeviceId,
+                        row.complianceState,row.managementAgent
+                    ].join('\n').toLowerCase();
                     if (!hay.includes(q)) return false;
                 }
                 return true;
             });
+            vm.models = aggregateModels(vm.filteredRows);
+            renderSummary();
+            renderModels();
             renderDevices();
+            updateActiveStateCard();
+        }
+
+        function sortCompare(a, b, key) {
+            if (key === 'lastScanTime' || key === 'lastSyncDateTime' || key === 'updateSubstateTime') {
+                const av = Date.parse(a?.[key] || '') || 0;
+                const bv = Date.parse(b?.[key] || '') || 0;
+                return av - bv;
+            }
+            if (key === 'canonicalState') {
+                const av = DRIVER_STATE_INFO[a?.canonicalState]?.order ?? 999;
+                const bv = DRIVER_STATE_INFO[b?.canonicalState]?.order ?? 999;
+                return av - bv;
+            }
+            const av = a?.[key];
+            const bv = b?.[key];
+            if (typeof av === 'number' && typeof bv === 'number') return av - bv;
+            return String(av ?? '').localeCompare(String(bv ?? ''), undefined, { numeric: true, sensitivity: 'base' });
+        }
+
+        function updateDeviceSortIndicators() {
+            overlay.querySelectorAll('.tm-di-device-table th[data-sort]').forEach(th => {
+                const active = th.dataset.sort === vm.sortKey;
+                th.classList.toggle('tm-di-sort-active', active);
+                th.setAttribute('aria-sort', active ? (vm.sortDesc ? 'descending' : 'ascending') : 'none');
+                const indicator = th.querySelector('.tm-di-sort-indicator');
+                if (indicator) indicator.textContent = active ? (vm.sortDesc ? '?' : '?') : '?';
+            });
+        }
+
+        function updateModelSortIndicators() {
+            overlay.querySelectorAll('.tm-di-model-table th[data-model-sort]').forEach(th => {
+                const active = th.dataset.modelSort === vm.modelSortKey;
+                th.classList.toggle('tm-di-sort-active', active);
+                th.setAttribute('aria-sort', active ? (vm.modelSortDesc ? 'descending' : 'ascending') : 'none');
+                const indicator = th.querySelector('.tm-di-sort-indicator');
+                if (indicator) indicator.textContent = active ? (vm.modelSortDesc ? '?' : '?') : '?';
+            });
         }
 
         function renderModels() {
-            refs.modelBody.innerHTML = vm.models.length ? vm.models.map(x => `
+            const models = [...vm.models].sort((a,b) => {
+                const cmp = sortCompare(a, b, vm.modelSortKey);
+                return vm.modelSortDesc ? -cmp : cmp;
+            });
+            refs.modelBody.innerHTML = models.length ? models.map(x => `
                 <tr data-manufacturer="${escapeHtml(x.manufacturer)}" data-model="${escapeHtml(x.model)}">
                     <td title="${escapeHtml(x.manufacturer)}">${escapeHtml(x.manufacturer)}</td>
                     <td title="${escapeHtml(x.model)}">${escapeHtml(x.model)}</td>
                     <td>${x.count}</td>
                     <td>${x.installed}</td>
                     <td>${x.inProgress}</td>
+                    <td>${x.cancelled}</td>
                     <td>${x.problems}</td>
                     <td>${x.percentage.toFixed(1)}%</td>
-                </tr>`).join('') : '<tr><td colspan="7">No model metadata available.</td></tr>';
+                </tr>`).join('') : '<tr><td colspan="8">No model metadata available for the current filter.</td></tr>';
+            updateModelSortIndicators();
         }
 
         function renderDevices() {
             const rows = [...vm.filteredRows].sort((a,b) => {
-                const av = String(a[vm.sortKey] ?? '');
-                const bv = String(b[vm.sortKey] ?? '');
-                const cmp = av.localeCompare(bv, undefined, { numeric: true, sensitivity: 'base' });
+                const cmp = sortCompare(a, b, vm.sortKey);
                 return vm.sortDesc ? -cmp : cmp;
             });
 
@@ -1826,35 +2053,43 @@
                     <td title="${escapeHtml(row.serialNumber)}">${escapeHtml(row.serialNumber)}</td>
                     <td title="${escapeHtml(`${row.operatingSystem} ${row.osVersion}`)}">${escapeHtml([row.operatingSystem,row.osVersion].filter(Boolean).join(' '))}</td>
                     <td title="${escapeHtml(row.userPrincipalName)}">${escapeHtml(row.userPrincipalName)}</td>
-                    <td title="${escapeHtml([row.aggregateState,row.updateSubstate,row.alertSubType].filter(Boolean).join(' · '))}"><span class="tm-di-badge">${escapeHtml(row.updateState)}</span></td>
+                    <td title="${escapeHtml([canonicalStateLabel(row.canonicalState),row.updateState,row.aggregateState,row.updateSubstate,row.alertSubType].filter(Boolean).join(' · '))}"><span class="tm-di-badge">${escapeHtml(row.updateState || canonicalStateLabel(row.canonicalState))}</span></td>
                     <td title="${escapeHtml(row.policyName)}">${escapeHtml(row.policyName)}</td>
                     <td title="${escapeHtml(formatDate(row.lastScanTime))}">${escapeHtml(formatDate(row.lastScanTime))}</td>
                     <td title="${escapeHtml(row.entraDeviceId)}">${escapeHtml(row.entraDeviceId)}</td>
                 </tr>`).join('') : '<tr><td colspan="10">No devices match the current filters.</td></tr>';
             refs.footerCount.textContent = `${rows.length} of ${vm.allRows.length} devices`;
+            updateDeviceSortIndicators();
         }
 
         function renderSummary() {
-            const uniqueModels = new Set(vm.allRows.filter(x => x.model).map(x => `${x.manufacturer}|${x.model}`));
-            const installed = vm.allRows.filter(x => String(x.updateState).toLowerCase() === 'installed').length;
-            const attention = vm.allRows.filter(x => {
-                const text = `${x.aggregateState || ''} ${x.updateState || ''}`.toLowerCase();
-                return text.includes('needs attention') || text.includes('error') || text.includes('failed');
-            }).length;
-            const inProgress = vm.allRows.length - installed - attention;
+            const allModels = new Set(vm.allRows.filter(x => x.model).map(x => `${x.manufacturer}|${x.model}`));
+            const counts = Object.fromEntries(Object.keys(DRIVER_STATE_INFO).map(key => [key, 0]));
+            for (const row of vm.allRows) counts[row.canonicalState || canonicalDriverState(row)]++;
+
             overlay.querySelector('[data-summary="reported"]').textContent = String(vm.allRows.length);
-            overlay.querySelector('[data-summary="installed"]').textContent = String(installed);
-            overlay.querySelector('[data-summary="inprogress"]').textContent = String(Math.max(0, inProgress));
-            overlay.querySelector('[data-summary="attention"]').textContent = String(attention);
-            overlay.querySelector('[data-summary="models"]').textContent = String(uniqueModels.size);
+            overlay.querySelector('[data-summary="visible"]').textContent = String(vm.filteredRows.length);
+            overlay.querySelector('[data-summary="models"]').textContent = String(allModels.size);
+            for (const key of Object.keys(DRIVER_STATE_INFO)) {
+                const node = overlay.querySelector(`[data-summary-state="${key}"]`);
+                if (node) node.textContent = String(counts[key] || 0);
+            }
         }
 
-        async function load() {
+        function updateActiveStateCard() {
+            const selected = refs.state.value;
+            overlay.querySelectorAll('[data-status-filter]').forEach(card => {
+                card.classList.toggle('is-active', Boolean(selected) && card.dataset.statusFilter === selected);
+            });
+        }
+
+        async function load(forceRefresh = false) {
+            if (forceRefresh && driver.driverId) state.reportCache.delete(normalizeText(driver.driverId).toLowerCase());
             state.currentLoadAbort?.abort();
             const controller = new AbortController();
             state.currentLoadAbort = controller;
             refs.deviceBody.innerHTML = '<tr><td colspan="10">Loading...</td></tr>';
-            refs.modelBody.innerHTML = '<tr><td colspan="7">Loading...</td></tr>';
+            refs.modelBody.innerHTML = '<tr><td colspan="8">Loading...</td></tr>';
             setProgress('Checking available Microsoft Graph permissions...', 3);
 
             const intuneToken = await waitForIntuneGraphToken(['DeviceManagementManagedDevices.Read.All'], 12000);
@@ -1865,7 +2100,7 @@
                     : 'No Microsoft Graph JWT was found in fetch/XHR, MSAL sessionStorage, authBootstrapState, portal messages, or sibling frames.';
                 setProgress('No Intune-capable Graph token is available after token synchronization and Intune Devices warm-up.', 100, true);
                 refs.deviceBody.innerHTML = `<tr><td colspan="10">The Driver Update report requires DeviceManagementManagedDevices.Read.All/ReadWrite.All.<br><small>${escapeHtml(details)}</small></td></tr>`;
-                refs.modelBody.innerHTML = '<tr><td colspan="7">No data.</td></tr>';
+                refs.modelBody.innerHTML = '<tr><td colspan="8">No data.</td></tr>';
                 return;
             }
 
@@ -1875,7 +2110,7 @@
                 overlay.querySelector('.tm-di-subtitle').textContent = `${driver.name} · ${driver.manufacturer} · Catalog ${driver.driverId}`;
 
                 setProgress('Preparing Intune Driver Update report...', 12);
-                const reportRows = await loadDriverReportRows(driver, controller.signal, text => setProgress(text, 28));
+                const reportRows = await loadDriverReportRows(driver, controller.signal, text => setProgress(text, 28), { forceRefresh });
                 setProgress(`Driver report returned ${reportRows.length} unique devices. Resolving hardware metadata...`, 55);
 
                 const aadIds = reportRows.map(x => x.entraDeviceId).filter(Boolean);
@@ -1902,11 +2137,8 @@
                 }
 
                 vm.allRows = toDeviceRows(reportRows, managedMap, entraMap);
-                vm.models = aggregateModels(vm.allRows);
                 vm.filteredRows = [...vm.allRows];
                 updateFilterOptions();
-                renderSummary();
-                renderModels();
                 applyFilters();
 
                 const expected = Number(driver.applicableDeviceCount);
@@ -1924,7 +2156,7 @@
                 warn(e);
                 setProgress(e.message || String(e), 100, true);
                 refs.deviceBody.innerHTML = `<tr><td colspan="10">${escapeHtml(e.message || String(e))}</td></tr>`;
-                refs.modelBody.innerHTML = '<tr><td colspan="7">No data.</td></tr>';
+                refs.modelBody.innerHTML = '<tr><td colspan="8">No data.</td></tr>';
             }
         }
 
@@ -1932,10 +2164,17 @@
             if (e.target === overlay || e.target.closest('[data-action="close"]')) {
                 removeOverlay(); return;
             }
+            const stateCard = e.target.closest('[data-status-filter]');
+            if (stateCard) {
+                const key = stateCard.dataset.statusFilter;
+                refs.state.value = refs.state.value === key ? '' : key;
+                applyFilters();
+                return;
+            }
             const action = e.target.closest('[data-action]')?.dataset.action;
-            if (action === 'refresh') load();
+            if (action === 'refresh') load(true);
             if (action === 'reset') {
-                refs.search.value = ''; refs.manufacturer.value = ''; refs.model.value = ''; refs.state.value = '';
+                refs.search.value = ''; refs.manufacturer.value = ''; refs.model.value = ''; refs.state.value = ''; refs.policy.value = ''; refs.os.value = '';
                 updateFilterOptions(); applyFilters();
             }
             if (action === 'copy') {
@@ -1947,7 +2186,7 @@
                 const cols = [
                     ['DeviceName','deviceName'], ['Manufacturer','manufacturer'], ['Model','model'], ['SerialNumber','serialNumber'],
                     ['OperatingSystem','operatingSystem'], ['OSVersion','osVersion'], ['UPN','userPrincipalName'], ['ComplianceState','complianceState'],
-                    ['UpdateState','updateState'], ['UpdateSubstate','updateSubstate'], ['UpdateSubstateTime','updateSubstateTime'], ['AggregateState','aggregateState'], ['AlertSubType','alertSubType'],
+                    ['CanonicalState','canonicalState'], ['UpdateState','updateState'], ['UpdateSubstate','updateSubstate'], ['UpdateSubstateTime','updateSubstateTime'], ['AggregateState','aggregateState'], ['AlertSubType','alertSubType'],
                     ['LastWUScanTime','lastScanTime'], ['LastIntuneSync','lastSyncDateTime'], ['Policy','policyName'], ['PolicyCount','policyCount'], ['EntraDeviceId','entraDeviceId'], ['IntuneDeviceId','intuneDeviceId'],
                 ];
                 const csv = '\uFEFF' + [
@@ -1967,6 +2206,8 @@
         refs.manufacturer.addEventListener('change', () => { updateFilterOptions(); applyFilters(); });
         refs.model.addEventListener('change', applyFilters);
         refs.state.addEventListener('change', applyFilters);
+        refs.policy.addEventListener('change', applyFilters);
+        refs.os.addEventListener('change', applyFilters);
 
         refs.modelBody.addEventListener('click', e => {
             const tr = e.target.closest('tr[data-model]');
@@ -1983,6 +2224,18 @@
                 if (vm.sortKey === key) vm.sortDesc = !vm.sortDesc;
                 else { vm.sortKey = key; vm.sortDesc = false; }
                 renderDevices();
+            });
+        });
+
+        overlay.querySelectorAll('.tm-di-model-table th[data-model-sort]').forEach(th => {
+            th.addEventListener('click', () => {
+                const key = th.dataset.modelSort;
+                if (vm.modelSortKey === key) vm.modelSortDesc = !vm.modelSortDesc;
+                else {
+                    vm.modelSortKey = key;
+                    vm.modelSortDesc = ['count','installed','inProgress','cancelled','problems','percentage'].includes(key);
+                }
+                renderModels();
             });
         });
 

@@ -48,7 +48,7 @@ Displays quality, feature, and driver update rollout dates in a calendar grouped
 
 Shows devices affected by Intune or Windows Autopatch driver updates, including driver status, model distribution, and device details.
 
-No screenshot is included for this script yet.
+![Driver Impact overview](<Intune - Driver Impact.user.png>)
 
 ### `Intune - Device Group Membership.user.js`
 
