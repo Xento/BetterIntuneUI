@@ -80,6 +80,10 @@ Use one userscript manager browser extension:
 
 No additional browser add-on is required. Depending on the script, the userscript manager may ask for access to the current page, `unsafeWindow`, cross-origin requests to Microsoft Graph, or local userscript storage. These permissions are declared in each script's metadata header; review them before installation.
 
+## Interface language
+
+The userscripts are designed for the English-language Microsoft Intune and Microsoft Entra admin center interface. Portal labels, selectors, and localized response text can differ when another interface language is selected.
+
 ## Permissions and data handling
 
 The scripts use the existing signed-in Microsoft Graph session. Access tokens are kept in memory while a script is running and are not written to the repository or to userscript storage. The naming designer stores its templates locally so they survive a browser restart; it does not store access tokens.
