@@ -1364,12 +1364,12 @@
             row?.alertSubType, row?.updateStateRaw, row?.aggregateStateRaw
         ].filter(Boolean).join(' ')).toLowerCase();
 
-        if (/(needs attention|eingreifen erforderlich|attention|error|failed|failure|fehler|fehlgeschlagen)/i.test(text)) return 'attention';
-        if (/(cancelled|canceled|cancel|abgebrochen|storniert)/i.test(text)) return 'cancelled';
-        if (/(installing|wird installiert|installation läuft|installiert wird)/i.test(text)) return 'installing';
-        if (/(offering|wird angeboten|angeboten|offer ready)/i.test(text)) return 'offering';
-        if (/(pending|ausstehend|scheduled|geplant)/i.test(text)) return 'pending';
-        if (/(installed|installiert|success|successful|erfolgreich|update installed)/i.test(text)) return 'installed';
+        if (/(needs attention|attention|error|failed|failure)/i.test(text)) return 'attention';
+        if (/(cancelled|canceled|cancel)/i.test(text)) return 'cancelled';
+        if (/installing/i.test(text)) return 'installing';
+        if (/(offering|offer ready)/i.test(text)) return 'offering';
+        if (/(pending|scheduled)/i.test(text)) return 'pending';
+        if (/(installed|success|successful|update installed)/i.test(text)) return 'installed';
         return 'unknown';
     }
 
