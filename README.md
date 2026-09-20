@@ -76,6 +76,7 @@ Use one userscript manager browser extension:
 
 - [Tampermonkey](https://www.tampermonkey.net/)
 - [Violentmonkey](https://violentmonkey.github.io/)
+- Greasemonkey is not currently supported for the complete script collection. Several scripts use legacy `GM_*` APIs that require a compatibility update for Greasemonkey 4+.
 
 No additional browser add-on is required. Depending on the script, the userscript manager may ask for access to the current page, `unsafeWindow`, cross-origin requests to Microsoft Graph, or local userscript storage. These permissions are declared in each script's metadata header; review them before installation.
 
